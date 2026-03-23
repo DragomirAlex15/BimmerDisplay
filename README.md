@@ -1,6 +1,6 @@
 BimmerGarageSoftware
 
-ESP32-based real-time automotive dashboard system.
+
 
 Overview
 
@@ -12,33 +12,33 @@ Display Receiver – Receives data via ESP-NOW and renders dashboard UI
 
 Features
 
--Direct CAN Bus reading (no ELM327)
+            -Direct CAN Bus reading (no ELM327)
 
--ESP-NOW wireless communication
+            -ESP-NOW wireless communication
 
--LVGL real-time dashboard
+            -LVGL real-time dashboard
 
 Live data display:
 
--Coolant temperature
+            -Coolant temperature
 
--Oil pressure
+            -Oil pressure
 
--Oil temperature
+            -Oil temperature
 
--Battery level
+            -Battery level
 
 Hardware
 
--ESP32 (WROOM-32)
+            -ESP32 (WROOM-32)
 
--SN65HVD230 CAN transceiver
+            -SN65HVD230 CAN transceiver
 
--OBD2 connector
+            -OBD2 connector
 
--TFT display (ST7789 240x320)
+            -TFT display (ST7789 240x320)
 
-12V → 5V DC-DC converter
+            12V → 5V DC-DC converter
 
 ⚠️ Never connect ESP32 directly to CAN lines without a transceiver.
 
