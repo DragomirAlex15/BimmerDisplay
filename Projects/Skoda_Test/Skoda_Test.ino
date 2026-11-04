@@ -46,6 +46,14 @@
 #define LGFX_USE_V1
 #include <LovyanGFX.hpp>
 
+// Definit AICI, inainte de orice functie: Arduino IDE genereaza automat
+// prototipuri pentru functii si le pune inaintea primei functii din fisier.
+// Daca struct-ul e definit mai jos, prototipurile care folosesc "Cell" nu compileaza.
+struct Cell {
+  lv_obj_t *val;
+  const char *unit;
+};
+
 /******************** CONFIG ELM327 ********************/
 // Numele tipic difuzat de clonele ieftine ELM327. Daca al tau se numeste altfel
 // (ex. "OBDLink", "Vlink", "V-LINK"), schimba-l aici - il vezi in setarile
@@ -118,10 +126,6 @@ static void my_disp_flush(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t
 lv_obj_t *lbl_status;
 lv_style_t style_title, style_value, style_status;
 
-struct Cell {
-  lv_obj_t *val;
-  const char *unit;
-};
 Cell cell_rpm, cell_coolant, cell_speed, cell_load;
 Cell cell_intake, cell_map, cell_throttle, cell_batt;
 
@@ -154,23 +158,23 @@ static void set_cell_err(Cell &c) {
 
 static void create_dashboard() {
   lv_obj_t *scr = lv_scr_act();
-  lv_obj_set_style_bg_color(scr, lv_color_hex(0x000000), 0);
+  lv_obj_set_style_bg_color(scr, lv_color_hex(0x00FF00), 0);   // fundal verde
   lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
 
   lv_style_init(&style_status);
-  lv_style_set_text_color(&style_status, lv_color_hex(0xFFFF00));
+  lv_style_set_text_color(&style_status, lv_color_hex(0x000000));
   lv_style_set_text_font(&style_status, &lv_font_montserrat_14);
   lv_style_set_bg_opa(&style_status, LV_OPA_TRANSP);
   lv_style_set_border_width(&style_status, 0);
 
   lv_style_init(&style_title);
-  lv_style_set_text_color(&style_title, lv_color_hex(0xFF6A00));
+  lv_style_set_text_color(&style_title, lv_color_hex(0x000000));
   lv_style_set_text_font(&style_title, &lv_font_montserrat_12);
   lv_style_set_bg_opa(&style_title, LV_OPA_TRANSP);
   lv_style_set_border_width(&style_title, 0);
 
   lv_style_init(&style_value);
-  lv_style_set_text_color(&style_value, lv_color_hex(0xFFFFFF));
+  lv_style_set_text_color(&style_value, lv_color_hex(0x000000));
   lv_style_set_text_font(&style_value, &lv_font_montserrat_20);
   lv_style_set_bg_opa(&style_value, LV_OPA_TRANSP);
   lv_style_set_border_width(&style_value, 0);
@@ -277,7 +281,7 @@ static bool readBatteryVoltage(float &v) {
 
 /******************** CONEXIUNE BLUETOOTH ********************/
 static bool connectELM() {
-  SerialBT.setPin(ELM_PIN);
+  SerialBT.setPin(ELM_PIN, strlen(ELM_PIN));   // ESP32 core 3.x cere si lungimea PIN-ului
   Serial.printf("[BT] Conectare la '%s'...\n", ELM_DEVICE_NAME);
 
   bool ok = USE_MAC_ADDRESS ? SerialBT.connect(ELM_MAC) : SerialBT.connect(ELM_DEVICE_NAME);
@@ -295,15 +299,30 @@ void setup() {
   Serial.begin(115200);
   delay(300);
   Serial.println("\n=== Skoda Fabia Mk2 (BZG 1.2) - Test ELM327 Bluetooth ===");
+  // Diagnostic: daca placa se reseteaza in bucla, aici vezi de ce
+  // (1=pornire normala, 4=crash/panic, 9=BROWNOUT -> alimentare insuficienta)
+  Serial.printf("[SYS] Motiv reset: %d | RAM libera: %u bytes\n",
+                (int)esp_reset_reason(), (unsigned)ESP.getFreeHeap());
+
+  // Bluetooth-ul porneste PRIMUL, cat timp e inca destula RAM interna libera
+  // (Bluedroid are nevoie de ~100KB+; daca bufferele LVGL sunt alocate inainte, poate crapa)
+  if (!SerialBT.begin("ESP32_Skoda_Test", true)) {   // true = master, initiaza el conexiunea
+    Serial.println("[BT] SerialBT.begin() a ESUAT - memorie insuficienta?");
+  }
+  Serial.printf("[SYS] RAM libera dupa pornire BT: %u bytes\n", (unsigned)ESP.getFreeHeap());
 
   lv_init();
   tft.init();
   tft.setRotation(1);
-  tft.fillScreen(TFT_BLACK);
+  tft.fillScreen(TFT_GREEN);
 
-  buf1 = (lv_color_t *)heap_caps_malloc(TFT_W * 80 * sizeof(lv_color_t), MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-  buf2 = (lv_color_t *)heap_caps_malloc(TFT_W * 80 * sizeof(lv_color_t), MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-  lv_disp_draw_buf_init(&draw_buf, buf1, buf2, TFT_W * 80);
+  // Buffere mai mici (20 linii in loc de 80) ca sa ramana RAM pentru Bluetooth.
+  // 2 x 12.8KB in loc de 2 x 51KB - pentru un ecran static ca asta nu se vede diferenta.
+  const uint32_t BUF_PIXELS = TFT_W * 20;
+  buf1 = (lv_color_t *)heap_caps_malloc(BUF_PIXELS * sizeof(lv_color_t), MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+  buf2 = (lv_color_t *)heap_caps_malloc(BUF_PIXELS * sizeof(lv_color_t), MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+  if (!buf1 || !buf2) Serial.println("[SYS] EROARE: nu am putut aloca bufferele de afisare!");
+  lv_disp_draw_buf_init(&draw_buf, buf1, buf2, BUF_PIXELS);
 
   static lv_disp_drv_t disp_drv;
   lv_disp_drv_init(&disp_drv);
@@ -316,8 +335,6 @@ void setup() {
   create_dashboard();
   set_status("Bluetooth: pornire...");
   lv_timer_handler();   // forteaza afisarea statusului pe ecran inainte de pasii blocanti de mai jos
-
-  SerialBT.begin("ESP32_Skoda_Test", true);   // true = master, initiaza el conexiunea
 
   elmLinkUp = connectELM();
   if (elmLinkUp) {
@@ -341,7 +358,9 @@ void loop() {
     if (millis() - lastReconnectAttempt > RECONNECT_INTERVAL_MS) {
       lastReconnectAttempt = millis();
       set_status("Reconectare la ELM327...");
+      lv_timer_handler();   // afiseaza mesajul INAINTE de connect() care blocheaza cateva secunde
       elmLinkUp = connectELM();
+      if (!elmLinkUp) set_status("Nu am gasit ELM327 - reincerc...");
       if (elmLinkUp) {
         elmEcuOk = elmInit();
         set_status(elmEcuOk ? "ECU OK - citesc date" : "Conectat, dar ECU nu raspunde");
