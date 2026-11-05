@@ -63,8 +63,8 @@ struct Cell {
 
 // Daca "dupa nume" nu functioneaza fiabil, pune adresa MAC exacta gasita prin
 // telefon (Setari > Bluetooth > pairing > detalii dispozitiv) si seteaza true.
-#define USE_MAC_ADDRESS false
-uint8_t ELM_MAC[6] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+#define USE_MAC_ADDRESS true
+uint8_t ELM_MAC[6] = { 0x00, 0x1D, 0xA5, 0x0B, 0x00, 0xB4 };   // "OBDII" gasit la scanare
 
 BluetoothSerial SerialBT;
 bool elmLinkUp = false;      // conexiune Bluetooth SPP activa
@@ -204,49 +204,89 @@ static void set_status(const String &s) {
 }
 
 /******************** ELM327 - COMUNICATIE ********************/
-static String elmSendCommand(const String &cmd, uint16_t timeoutMs = 2000) {
+String lastEcuMsg = "";   // ultimul raspuns/eroare de la ECU, afisat pe ecran
+String pidSuffix = "";    // "1" daca adaptorul suporta raspuns rapid (vezi elmFindEcu)
+
+// Trimite o comanda si asteapta promptul '>' al ELM327.
+// IMPORTANT: ELM327 abandoneaza comanda curenta daca primeste orice caracter
+// inainte sa termine. Daca nu asteptam '>', urmatoarea comanda o strica pe cea
+// in curs si toate raspunsurile se decaleaza. De aceea, la timeout mai asteptam
+// promptul inca cateva secunde ca sa resincronizam.
+static String elmSendCommand(const String &cmd, uint32_t timeoutMs = 4000) {
   while (SerialBT.available()) SerialBT.read();   // curata buffer vechi
 
   SerialBT.print(cmd);
   SerialBT.print('\r');
 
   String resp;
+  bool gotPrompt = false;
   uint32_t start = millis();
   while (millis() - start < timeoutMs) {
     if (SerialBT.available()) {
       char c = SerialBT.read();
-      if (c == '>') break;   // promptul ELM327 = raspuns complet
+      if (c == '>') { gotPrompt = true; break; }   // promptul ELM327 = raspuns complet
       resp += c;
+    } else {
+      delay(1);
     }
   }
+
+  if (!gotPrompt) {
+    Serial.printf("[ELM] TIMEOUT la '%s' - astept resincronizare...\n", cmd.c_str());
+    uint32_t t = millis();
+    while (millis() - t < 8000) {
+      if (SerialBT.available() && SerialBT.read() == '>') break;
+      delay(1);
+    }
+  }
+
   resp.replace("\r", " ");
   resp.replace("\n", " ");
+  resp.replace("SEARCHING...", "");
   resp.trim();
   while (resp.indexOf("  ") >= 0) resp.replace("  ", " ");
+  Serial.printf("[ELM] %s -> %s\n", cmd.c_str(), resp.c_str());
   return resp;
 }
 
-static bool elmInit() {
-  struct { const char *cmd; const char *label; } initSeq[] = {
-    { "ATZ",  "Reset adaptor" },
-    { "ATE0", "Echo OFF" },
-    { "ATL0", "Linefeed OFF" },
-    { "ATH0", "Headere OFF" },
-    { "ATSP0", "Protocol AUTO" },
-  };
-  for (auto &s : initSeq) {
-    String r = elmSendCommand(s.cmd, 3000);
-    Serial.printf("[ELM] %-14s -> %s\n", s.label, r.c_str());
-    delay(100);
-  }
+// Incearca sa vorbeasca cu ECU-ul. Prima data protocol AUTO; daca nu merge,
+// fortam pe rand protocoalele posibile pe o Fabia 2008 (linie K sau CAN).
+static bool elmFindEcu() {
+  const char *protocols[] = { "0", "5", "4", "3", "6" };
+  // 0=AUTO, 5=KWP2000 fast init, 4=KWP2000 5-baud, 3=ISO9141, 6=CAN 500k
+  for (const char *p : protocols) {
+    elmSendCommand(String("ATSP") + p, 2000);
+    String r = elmSendCommand("0100", 15000);   // initializarea pe linia K poate dura ~10s
+    if (r.indexOf("41 00") >= 0) {
+      String dp = elmSendCommand("ATDPN", 2000);
+      lastEcuMsg = "ECU OK, protocol " + dp;
 
-  String r = elmSendCommand("0100", 3000);   // PID-uri suportate 01-20 = "ping" catre ECU
-  Serial.printf("[ELM] PID-uri suportate    -> %s\n", r.c_str());
-  return r.indexOf("NO DATA") < 0 && r.indexOf("UNABLE") < 0 && r.length() > 0;
+      // VITEZA: timing adaptiv agresiv + sufixul "1" la PID-uri
+      // ("010C1" = asteapta 1 singur raspuns -> ELM nu mai asteapta timeout dupa el).
+      // Unele clone nu stiu sufixul, asa ca il testam inainte sa-l folosim.
+      elmSendCommand("ATAT2", 2000);
+      String t = elmSendCommand("010C1", 4000);
+      pidSuffix = (t.indexOf("41 0C") >= 0) ? "1" : "";
+      Serial.printf("[ELM] Sufix rapid PID: %s\n", pidSuffix.length() ? "DA" : "NU (adaptorul nu-l suporta)");
+      return true;
+    }
+    lastEcuMsg = "ECU: " + (r.length() ? r : String("fara raspuns"));
+  }
+  return false;
+}
+
+static bool elmInit() {
+  elmSendCommand("ATZ", 5000);   // reset
+  delay(500);
+  elmSendCommand("ATE0", 2000);  // echo OFF
+  elmSendCommand("ATL0", 2000);  // linefeed OFF
+  elmSendCommand("ATS1", 2000);  // spatii intre octeti (parserul de mai jos se bazeaza pe ele)
+  elmSendCommand("ATH0", 2000);  // headere OFF
+  return elmFindEcu();
 }
 
 static bool queryPidBytes(const String &pid, uint8_t *out, int expectedBytes) {
-  String r = elmSendCommand(pid, 2000);
+  String r = elmSendCommand(pid + pidSuffix, 4000);
   String marker = "41 " + pid.substring(2);
   int idx = r.indexOf(marker);
   if (idx < 0) return false;
@@ -272,7 +312,7 @@ static bool readThrottle(int &v) { uint8_t b[1]; if (!queryPidBytes("0111", b, 1
 static bool readBatteryVoltage(float &v) {
   // ATRV = comanda specifica adaptorului ELM327 (nu PID OBD), citeste direct
   // tensiunea de pe pinul 16 al OBD2 - functioneaza chiar daca ECU-ul nu raspunde.
-  String r = elmSendCommand("ATRV", 2000);
+  String r = elmSendCommand("ATRV", 3000);
   int idx = r.indexOf('V');
   if (idx < 1) return false;
   v = r.substring(0, idx).toFloat();
@@ -336,58 +376,106 @@ void setup() {
   set_status("Bluetooth: pornire...");
   lv_timer_handler();   // forteaza afisarea statusului pe ecran inainte de pasii blocanti de mai jos
 
-  elmLinkUp = connectELM();
-  if (elmLinkUp) {
-    set_status("Conectat, initializez ELM327...");
-    lv_timer_handler();
-    elmEcuOk = elmInit();
-    set_status(elmEcuOk ? "ECU OK - citesc date" : "Conectat, dar ECU nu raspunde");
-  } else {
-    set_status("Nu am gasit ELM327 - reincerc...");
-  }
-  lv_timer_handler();
-  lastReconnectAttempt = millis();
+  lastReconnectAttempt = millis() - RECONNECT_INTERVAL_MS;   // conectare imediat in loop()
 }
 
 /******************** LOOP ********************/
+uint32_t lastEcuRetry = 0;
+const uint32_t ECU_RETRY_MS = 15000;
+int ecuFailCycles = 0;
+
+// Status scurt, ca sa incapa pe un rand de ecran (320px)
+static void set_status_short(const String &s) {
+  set_status(s.length() > 40 ? s.substring(0, 40) : s);
+  lv_timer_handler();
+}
+
+static void updateBattery() {
+  float volt;
+  if (readBatteryVoltage(volt)) {
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%.1fV", volt);
+    lv_label_set_text(cell_batt.val, buf);
+  } else {
+    set_cell_err(cell_batt);
+  }
+}
+
+// Citeste un PID si actualizeaza ecranul imediat (fiecare PID poate dura ~0.1-4s)
+static bool readCell(bool (*fn)(int &), Cell &c) {
+  int v;
+  bool ok = fn(v);
+  if (ok) set_cell(c, v); else set_cell_err(c);
+  lv_timer_handler();
+  return ok;
+}
+
 void loop() {
-  // reconectare automata daca legatura Bluetooth cade
+  // 1) Bluetooth cazut -> reconectare
   if (!SerialBT.connected()) {
     elmLinkUp = false;
     elmEcuOk = false;
     if (millis() - lastReconnectAttempt > RECONNECT_INTERVAL_MS) {
       lastReconnectAttempt = millis();
-      set_status("Reconectare la ELM327...");
-      lv_timer_handler();   // afiseaza mesajul INAINTE de connect() care blocheaza cateva secunde
+      set_status_short("Conectare la ELM327...");
       elmLinkUp = connectELM();
-      if (!elmLinkUp) set_status("Nu am gasit ELM327 - reincerc...");
-      if (elmLinkUp) {
+      if (!elmLinkUp) {
+        set_status_short("Nu gasesc ELM327 - reincerc...");
+      } else {
+        set_status_short("Conectat, caut ECU (poate dura 1 min)...");
         elmEcuOk = elmInit();
-        set_status(elmEcuOk ? "ECU OK - citesc date" : "Conectat, dar ECU nu raspunde");
+        set_status_short(lastEcuMsg);
+        lastEcuRetry = millis();
       }
     }
-  } else if (elmLinkUp) {
-    set_status(elmEcuOk ? "OK - live data" : "Conectat, dar ECU nu raspunde");
-
-    int v;
-    if (readRPM(v))      set_cell(cell_rpm, v);      else set_cell_err(cell_rpm);
-    if (readCoolant(v))  set_cell(cell_coolant, v);  else set_cell_err(cell_coolant);
-    if (readSpeed(v))    set_cell(cell_speed, v);    else set_cell_err(cell_speed);
-    if (readLoad(v))     set_cell(cell_load, v);     else set_cell_err(cell_load);
-    if (readIntake(v))   set_cell(cell_intake, v);   else set_cell_err(cell_intake);
-    if (readMAP(v))      set_cell(cell_map, v);      else set_cell_err(cell_map);
-    if (readThrottle(v)) set_cell(cell_throttle, v); else set_cell_err(cell_throttle);
-
-    float volt;
-    if (readBatteryVoltage(volt)) {
-      char buf[16];
-      snprintf(buf, sizeof(buf), "%.1fV", volt);
-      lv_label_set_text(cell_batt.val, buf);
-    } else {
-      set_cell_err(cell_batt);
-    }
+    lv_timer_handler();
+    delay(5);
+    return;
   }
 
-  lv_timer_handler();
+  // 2) Bluetooth OK dar ECU nu raspunde -> doar tensiune + reincercare periodica
+  if (!elmEcuOk) {
+    updateBattery();
+    if (millis() - lastEcuRetry > ECU_RETRY_MS) {
+      lastEcuRetry = millis();
+      set_status_short("Reincerc ECU... (contact pe ON?)");
+      elmEcuOk = elmFindEcu();
+      ecuFailCycles = 0;
+    }
+    set_status_short(lastEcuMsg);
+    delay(500);
+    return;
+  }
+
+  // 3) ECU OK -> date live
+  // Valorile care se schimba rapid se citesc la FIECARE ciclu; temperaturile si
+  // tensiunea se schimba lent, deci doar la fiecare al 5-lea ciclu -> refresh mai des.
+  static uint8_t cycle = 0;
+  uint32_t cycleStart = millis();
+  int okCount = 0, total = 5;
+  okCount += readCell(readRPM,      cell_rpm);
+  okCount += readCell(readSpeed,    cell_speed);
+  okCount += readCell(readThrottle, cell_throttle);
+  okCount += readCell(readMAP,      cell_map);
+  okCount += readCell(readLoad,     cell_load);
+  if (cycle++ % 5 == 0) {
+    okCount += readCell(readCoolant, cell_coolant);
+    okCount += readCell(readIntake,  cell_intake);
+    total += 2;
+    updateBattery();
+  }
+  Serial.printf("[LOOP] ciclu %u ms, %d/%d PID OK\n", (unsigned)(millis() - cycleStart), okCount, total);
+
+  if (okCount == 0) {
+    // 3 cicluri la rand fara niciun raspuns -> ECU pierdut (ex. contact OFF)
+    if (++ecuFailCycles >= 3) {
+      elmEcuOk = false;
+      lastEcuMsg = "ECU nu mai raspunde";
+      lastEcuRetry = millis();
+    }
+  } else {
+    ecuFailCycles = 0;
+  }
+  set_status_short(elmEcuOk ? "OK - live (" + String(okCount) + "/" + String(total) + " PID)" : lastEcuMsg);
   delay(5);
 }
