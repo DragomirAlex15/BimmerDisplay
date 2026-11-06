@@ -79,8 +79,19 @@ ELM327 din portul OBD2.
 
 ## Mod setări (din telefon, fără aplicație)
 
-Din telefon (Android sau iPhone) poți schimba culoarea fundalului, culoarea
-scrisului și imaginea de start.
+Din telefon (Android sau iPhone) poți schimba:
+
+- culoarea fundalului, a scrisului și culoarea de avertizare;
+- mărimea valorilor și a titlurilor (automat sau 10–48 px) și bold-ul;
+- **ce parametri apar pe ecran**: 8 căsuțe, fiecare cu un parametru din 22 sau
+  goală. Ecranul se aranjează singur (1–8 căsuțe). Pentru fiecare căsuță poți
+  pune o limită **min/max**. În afara ei, căsuța apare în culoarea de
+  avertizare;
+- imaginea de start.
+
+La prima conectare la ECU, ESP32-ul salvează lista PID-urilor pe care mașina
+le suportă. În pagină, parametrii nesuportați sunt marcați „✕ nesuportat”, iar
+pe ecran apar ca `n/a` și nu mai sunt interogați.
 
 1. Alimentează placa. Cât timp e afișată imaginea de start (~3 s), ține
    apăsat **BOOT** ~1 secundă. Nu ține BOOT apăsat în momentul alimentării,
