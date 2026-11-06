@@ -77,6 +77,29 @@ Identic cu wiring-ul din `Factory_samples_without_touch`: TFT ST7789
 sau placă a doua — un singur ESP32, împerecheat direct cu adaptorul
 ELM327 din portul OBD2.
 
+## Mod setări (din telefon, fără aplicație)
+
+Din telefon (Android sau iPhone) poți schimba culoarea fundalului, culoarea
+scrisului și imaginea de start.
+
+1. Alimentează placa. Cât timp e afișată imaginea de start (~3 s), ține
+   apăsat **BOOT** ~1 secundă. Nu ține BOOT apăsat în momentul alimentării,
+   pentru că atunci placa intră în modul de programare.
+2. Conectează telefonul la WiFi **`Skoda_Display`**, parola **`12345678`**.
+   Pagina se deschide singură. Dacă nu, intră pe `http://192.168.4.1`.
+3. Alegi setările. Culorile se văd imediat pe display.
+   Apeși **Salvează și repornește**.
+
+În modul setări Bluetooth-ul e oprit, deci nu se citesc date de la mașină.
+Ieși apăsând **Salvează**, apăsând **BOOT** (fără salvare) sau automat, după
+10 minute fără niciun telefon conectat.
+
+- **Partition Scheme** trebuie să fie *Huge APP (3MB No OTA/1MB SPIFFS)*.
+  Imaginea de start se salvează în partiția SPIFFS.
+- **Luminozitate**: nu se poate regla din software. Pe această placă
+  backlight-ul e legat fix la alimentare. Am verificat cu
+  `Projects/Backlight_Test`: niciun pin liber nu îl controlează.
+
 ## Librării necesare
 
 - LovyanGFX
