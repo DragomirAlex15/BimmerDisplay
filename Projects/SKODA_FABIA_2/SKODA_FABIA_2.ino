@@ -142,6 +142,34 @@ struct Cell {
   lv_obj_t *valB;
 };
 
+/******************** CODURI DE EROARE (DTC) ********************/
+struct Dtc {
+  uint16_t raw;     // cei 2 octeti de la ECU (litera + 4 cifre), ex. P0301 = 0x0301
+  bool pending;     // true = eroare "in asteptare" (Mode 07), false = memorata (Mode 03)
+};
+
+#define MAX_DTC 16
+Dtc dtcList[MAX_DTC];
+uint8_t dtcCount = 0;
+bool dtcKnown = false;                 // am citit erorile macar o data
+bool milOn = false;                    // martorul "check engine" aprins
+uint32_t dtcReadAt = 0;                // cand au fost citite ultima data
+bool dtcRefreshRequested = false;      // citire imediata (la intrarea pe ecranul de erori)
+const uint32_t DTC_INTERVAL_MS = 60000;      // pe ecranul cu date live: o data pe minut
+const uint32_t DTC_INTERVAL_ERR_MS = 30000;  // pe ecranul de erori: la 30 secunde
+
+// Butonul BOOT in timpul mersului: comuta intre date live si lista de erori.
+// Prin intrerupere, ca apasarea sa nu se piarda cat timp asteptam raspunsuri de la ELM327.
+volatile bool bootPressed = false;
+bool errScreen = false;
+
+// Codul ca text, ex. "P0301", din cei 2 octeti primiti de la ECU:
+// primii 2 biti = litera (00=P, 01=C, 10=B, 11=U), restul = cele 4 cifre
+static void dtcToStr(uint16_t raw, char *out, size_t n) {
+  static const char LETTERS[] = "PCBU";
+  snprintf(out, n, "%c%04X", LETTERS[raw >> 14], raw & 0x3FFF);
+}
+
 /******************** CONFIG ELM327 ********************/
 // Numele tipic difuzat de clonele ieftine ELM327. Daca al tau se numeste altfel
 // (ex. "OBDLink", "Vlink", "V-LINK"), schimba-l aici - il vezi in setarile
@@ -335,6 +363,12 @@ static bool paramSupported(uint8_t id) {
 /******************** UI ********************/
 lv_obj_t *lbl_status;
 lv_style_t style_status;
+lv_obj_t *scr_dash = nullptr;      // ecranul cu date live
+lv_obj_t *scr_err = nullptr;       // ecranul cu lista de erori
+lv_obj_t *lbl_dtc_badge = nullptr; // "! 2 ERORI" sus in dreapta pe ecranul live
+lv_obj_t *lbl_err_info = nullptr;
+lv_obj_t *lbl_err_list = nullptr;      // mesaj cand nu sunt coduri
+lv_obj_t *lbl_codes[MAX_DTC];          // cate o eticheta pentru fiecare cod, in grila 3 coloane
 
 Cell cells[MAX_SLOTS];
 uint8_t activeSlot[MAX_SLOTS];   // pentru fiecare casuta afisata: indexul ei in cfgSlots
@@ -382,6 +416,7 @@ static lv_obj_t *mkLabel(lv_obj_t *parent, const char *txt, const lv_font_t *f, 
 
 static void create_dashboard() {
   lv_obj_t *scr = lv_scr_act();
+  scr_dash = scr;
   lv_obj_set_style_bg_color(scr, lv_color_hex(cfgBg), 0);   // culoare fundal din setari
   lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
 
@@ -395,6 +430,13 @@ static void create_dashboard() {
   lv_label_set_text(lbl_status, "Pornire...");
   lv_obj_add_style(lbl_status, &style_status, 0);
   lv_obj_set_pos(lbl_status, 5, 4);
+  lv_obj_set_width(lbl_status, 225);                     // loc in dreapta pentru indicatorul de erori
+  lv_label_set_long_mode(lbl_status, LV_LABEL_LONG_CLIP);
+
+  // indicator erori (gol cat timp nu sunt erori)
+  lbl_dtc_badge = mkLabel(scr, "", &lv_font_montserrat_14, 0, 4);
+  lv_obj_set_style_text_color(lbl_dtc_badge, lv_color_hex(cfgWarn), 0);
+  lv_obj_align(lbl_dtc_badge, LV_ALIGN_TOP_RIGHT, -5, 4);
 
   // casutele alese in setari, in ordine, fara cele goale
   activeCount = 0;
@@ -442,6 +484,95 @@ static void create_dashboard() {
     c.valB   = cfgValBold ? mkLabel(scr, init, vf, x + 1, vy) : nullptr;
     c.val    = mkLabel(scr, init, vf, x, vy);
   }
+}
+
+/******************** ECRAN ERORI ********************/
+static void create_error_screen() {
+  scr_err = lv_obj_create(NULL);
+  lv_obj_set_style_bg_color(scr_err, lv_color_hex(cfgBg), 0);
+  lv_obj_set_style_bg_opa(scr_err, LV_OPA_COVER, 0);
+  lv_obj_clear_flag(scr_err, LV_OBJ_FLAG_SCROLLABLE);
+
+  mkLabel(scr_err, "ERORI MOTOR", &lv_font_montserrat_22, 8, 4);
+  lbl_err_info = mkLabel(scr_err, "", &lv_font_montserrat_14, 8, 34);
+  lv_obj_set_width(lbl_err_info, TFT_W - 16);
+  lv_label_set_long_mode(lbl_err_info, LV_LABEL_LONG_CLIP);
+
+  lbl_err_list = mkLabel(scr_err, "", &lv_font_montserrat_20, 8, 70);
+
+  // grila de coduri: 3 coloane x 6 randuri (incap toate cele MAX_DTC = 16)
+  for (uint8_t i = 0; i < MAX_DTC; i++) {
+    lbl_codes[i] = mkLabel(scr_err, "", &lv_font_montserrat_24, 8 + (i % 3) * 104, 60 + (i / 3) * 26);
+    lv_obj_set_style_text_color(lbl_codes[i], lv_color_hex(cfgWarn), 0);
+  }
+
+  mkLabel(scr_err, "BOOT = inapoi      ? = eroare in asteptare", &lv_font_montserrat_12, 8, TFT_H - 18);
+}
+
+static void refreshErrorScreen() {
+  if (!scr_err) return;
+
+  // randul de info: starea conexiunii + martor + cand am citit
+  char info[64];
+  if (!dtcKnown) {
+    snprintf(info, sizeof(info), "%s", elmEcuOk ? "Citesc erorile..." : "Nu sunt conectat la ECU");
+  } else {
+    uint32_t ago = (millis() - dtcReadAt) / 1000;
+    snprintf(info, sizeof(info), "Martor motor: %s  |  citit acum %us%s",
+             milOn ? "APRINS" : "stins", (unsigned)ago, elmEcuOk ? "" : " (deconectat)");
+  }
+  lv_label_set_text(lbl_err_info, info);
+
+  // doar codurile; "?" dupa cod = eroare in asteptare (Mode 07)
+  for (uint8_t i = 0; i < MAX_DTC; i++) {
+    if (dtcKnown && i < dtcCount) {
+      char code[8];
+      dtcToStr(dtcList[i].raw, code, sizeof(code));
+      if (dtcList[i].pending) strcat(code, "?");
+      lv_label_set_text(lbl_codes[i], code);
+    } else {
+      lv_label_set_text(lbl_codes[i], "");
+    }
+  }
+  lv_label_set_text(lbl_err_list, (dtcKnown && dtcCount == 0) ? LV_SYMBOL_OK "  Nicio eroare" : "");
+}
+
+// Indicatorul de pe ecranul live
+static void updateDtcBadge() {
+  if (!lbl_dtc_badge) return;
+  if (dtcKnown && dtcCount > 0) {
+    char b[24];
+    snprintf(b, sizeof(b), LV_SYMBOL_WARNING " %u %s", dtcCount, dtcCount == 1 ? "EROARE" : "ERORI");
+    lv_label_set_text(lbl_dtc_badge, b);
+  } else {
+    lv_label_set_text(lbl_dtc_badge, "");
+  }
+  lv_obj_align(lbl_dtc_badge, LV_ALIGN_TOP_RIGHT, -5, 4);
+}
+
+void IRAM_ATTR onBootPress() {
+  static uint32_t last = 0;
+  uint32_t now = millis();
+  if (now - last > 300) {   // anti-vibratie contact
+    bootPressed = true;
+    last = now;
+  }
+}
+
+// Daca s-a apasat BOOT, comuta ecranul. Returneaza true daca s-a comutat.
+static bool checkScreenToggle() {
+  if (!bootPressed || !scr_err) return false;
+  bootPressed = false;
+  errScreen = !errScreen;
+  if (errScreen) {
+    refreshErrorScreen();
+    lv_scr_load(scr_err);
+    dtcRefreshRequested = true;   // citim erorile proaspat cand intram pe ecran
+  } else {
+    lv_scr_load(scr_dash);
+  }
+  lv_timer_handler();
+  return true;
 }
 
 static void setCellText(Cell &c, const char *txt) {
@@ -936,6 +1067,7 @@ static void configLoop() {
 String lastEcuMsg = "";   // ultimul raspuns/eroare de la ECU, afisat pe ecran
 String pidSuffix = "";    // "1" daca adaptorul suporta raspuns rapid (vezi elmFindEcu)
 float baroKpa = 101.0f;   // presiune atmosferica, folosita la VACUUM (actualizata periodic)
+bool isCanProtocol = false;   // raspunsul la erori are alt format pe CAN fata de linia K
 
 // Cauta in raspuns marker-ul (ex. "41 0C") si extrage urmatorii n octeti hex
 static bool parseResponseBytes(const String &r, const String &marker, uint8_t *out, int n) {
@@ -1000,14 +1132,19 @@ static String elmSendCommand(const String &cmd, uint32_t timeoutMs = 4000) {
 // Incearca sa vorbeasca cu ECU-ul. Prima data protocol AUTO; daca nu merge,
 // fortam pe rand protocoalele posibile pe o Fabia 2008 (linie K sau CAN).
 static bool elmFindEcu() {
-  const char *protocols[] = { "0", "5", "4", "3", "6" };
-  // 0=AUTO, 5=KWP2000 fast init, 4=KWP2000 5-baud, 3=ISO9141, 6=CAN 500k
+  const char *protocols[] = { "0", "5", "4", "3", "6", "8", "7", "9" };
+  // 0=AUTO, 5=KWP2000 fast init, 4=KWP2000 5-baud, 3=ISO9141 (linie K),
+  // 6=CAN 11bit 500k (VAG pe CAN), 8=CAN 11bit 250k, 7=CAN 29bit 500k, 9=CAN 29bit 250k
+  // Pe CAN nu exista initializare lunga ca pe linia K -> incercarile esuate dureaza putin.
   for (const char *p : protocols) {
     elmSendCommand(String("ATSP") + p, 2000);
     String r = elmSendCommand("0100", 15000);   // initializarea pe linia K poate dura ~10s
     if (r.indexOf("41 00") >= 0) {
       String dp = elmSendCommand("ATDPN", 2000);
       lastEcuMsg = "ECU OK, protocol " + dp;
+      // ATDPN: "6".."9" (sau "A6".."A9") = CAN; restul = linie K / J1850
+      char pc = dp.length() ? dp[dp.length() - 1] : '0';
+      isCanProtocol = (pc >= '6' && pc <= '9') || (pc >= 'A' && pc <= 'C');
 
       // Lista PID-urilor suportate: 0100 -> PID 01-20, 0120 -> 21-40, 0140 -> 41-60.
       // Ultimul bit al fiecarui raspuns spune daca exista urmatorul grup.
@@ -1093,6 +1230,74 @@ static bool readParam(uint8_t id, float &v) {
   return true;
 }
 
+/******************** CODURI DE EROARE - CITIRE ********************/
+static void addDtc(Dtc *list, uint8_t &n, uint16_t raw, bool pending) {
+  if (raw == 0 || n >= MAX_DTC) return;
+  for (uint8_t i = 0; i < n; i++) if (list[i].raw == raw) return;   // fara dubluri
+  list[n++] = { raw, pending };
+}
+
+// Raspunsul la Mode 03/07, cu headere oprite (ATH0):
+//  - linie K (ISO9141/KWP): fiecare rand = "43 AA BB CC DD EE FF" -> 3 coduri, 00 00 = gol
+//  - CAN: "43 NN AA BB ..." cu NN = numar coduri; la mai multe coduri raspunsul vine pe
+//    mai multe randuri numerotate ("0:", "1:") precedate de lungime ("00A")
+static void parseDtcResponse(const String &r, uint8_t modeByte, bool pending, Dtc *list, uint8_t &n) {
+  uint8_t bytes[96];
+  int nb = 0;
+  int i = 0, len = r.length();
+  while (i < len && nb < (int)sizeof(bytes)) {
+    while (i < len && r[i] == ' ') i++;
+    int start = i;
+    while (i < len && r[i] != ' ') i++;
+    String tok = r.substring(start, i);
+    // pastram doar octetii hex de 2 caractere (sarim "0:", "00A", "NO", "DATA" etc.)
+    if (tok.length() == 2 && isxdigit(tok[0]) && isxdigit(tok[1]))
+      bytes[nb++] = (uint8_t)strtol(tok.c_str(), nullptr, 16);
+  }
+
+  for (int k = 0; k < nb; k++) {
+    if (bytes[k] != modeByte) continue;
+    if (isCanProtocol) {
+      if (k + 1 >= nb) break;
+      int cnt = bytes[k + 1];
+      int j = k + 2;
+      for (int c = 0; c < cnt && j + 1 < nb; c++, j += 2) addDtc(list, n, (bytes[j] << 8) | bytes[j + 1], pending);
+      k = j - 1;
+    } else {
+      int j = k + 1;
+      for (int c = 0; c < 3 && j + 1 < nb; c++, j += 2) addDtc(list, n, (bytes[j] << 8) | bytes[j + 1], pending);
+      k = j - 1;
+    }
+  }
+}
+
+// Mode 03 = erori memorate, Mode 07 = erori in asteptare, 0101 = martor check engine.
+// NU stergem niciodata erorile (Mode 04 nu e folosit).
+static void readDtcs() {
+  Dtc tmp[MAX_DTC];
+  uint8_t n = 0;
+  parseDtcResponse(elmSendCommand("03", 6000), 0x43, false, tmp, n);
+  parseDtcResponse(elmSendCommand("07", 6000), 0x47, true, tmp, n);
+  uint8_t b[1];
+  if (queryPidBytes("0101", b, 1)) milOn = b[0] & 0x80;
+
+  memcpy(dtcList, tmp, sizeof(Dtc) * n);
+  dtcCount = n;
+  dtcKnown = true;
+  dtcReadAt = millis();
+
+  Serial.printf("[DTC] %u erori, martor %s:", n, milOn ? "APRINS" : "stins");
+  char code[8];
+  for (uint8_t i = 0; i < n; i++) {
+    dtcToStr(dtcList[i].raw, code, sizeof(code));
+    Serial.printf(" %s%s", code, dtcList[i].pending ? "(asteptare)" : "");
+  }
+  Serial.println();
+
+  updateDtcBadge();
+  refreshErrorScreen();
+}
+
 /******************** CONEXIUNE BLUETOOTH ********************/
 static bool connectELM() {
   SerialBT.setPin(ELM_PIN, strlen(ELM_PIN));   // ESP32 core 3.x cere si lungimea PIN-ului
@@ -1159,8 +1364,13 @@ void setup() {
   lv_disp_drv_register(&disp_drv);
 
   create_dashboard();
+  create_error_screen();
   set_status("Bluetooth: pornire...");
   lv_timer_handler();   // forteaza afisarea statusului pe ecran inainte de pasii blocanti de mai jos
+
+  // de acum, o apasare pe BOOT comuta intre date live si lista de erori
+  attachInterrupt(digitalPinToInterrupt(BOOT_PIN), onBootPress, FALLING);
+  bootPressed = false;
 
   lastReconnectAttempt = millis() - RECONNECT_INTERVAL_MS;   // conectare imediat in loop()
 }
@@ -1193,6 +1403,15 @@ void loop() {
   if (configMode) {
     configLoop();
     return;
+  }
+
+  // BOOT apasat -> comuta ecranul; pe ecranul de erori actualizam "citit acum Xs"
+  checkScreenToggle();
+  static uint32_t lastErrInfo = 0;
+  if (errScreen && millis() - lastErrInfo > 1000) {
+    lastErrInfo = millis();
+    refreshErrorScreen();
+    lv_timer_handler();
   }
 
   // 1) Bluetooth cazut -> reconectare
@@ -1231,7 +1450,23 @@ void loop() {
     return;
   }
 
-  // 3) ECU OK -> date live
+  // 3a) ECU OK + ecranul de erori -> doar erorile, fara date live
+  if (errScreen) {
+    if (dtcRefreshRequested || !dtcKnown || millis() - dtcReadAt > DTC_INTERVAL_ERR_MS) {
+      dtcRefreshRequested = false;
+      lv_label_set_text(lbl_err_info, "Citesc erorile...");
+      lv_timer_handler();
+      readDtcs();
+    }
+    lv_timer_handler();
+    delay(20);
+    return;
+  }
+
+  // erorile se verifica si in fundal (o data pe minut) pentru indicatorul de sus
+  if (!dtcKnown || millis() - dtcReadAt > DTC_INTERVAL_MS) readDtcs();
+
+  // 3b) ECU OK -> date live
   // Valorile care se schimba rapid se citesc la FIECARE ciclu; temperaturile si
   // tensiunea se schimba lent, deci doar la fiecare al 5-lea ciclu -> refresh mai des.
   static uint8_t cycle = 0;
@@ -1246,6 +1481,7 @@ void loop() {
   }
 
   for (uint8_t ci = 0; ci < activeCount; ci++) {
+    if (checkScreenToggle()) return;      // BOOT apasat in timpul ciclului -> trecem imediat pe erori
     uint8_t id = cfgSlots[activeSlot[ci]].param;
     const ParamDef &p = PARAMS[id];
     if (p.slow && !slowCycle) continue;   // temperaturi, tensiuni etc. - doar la fiecare al 5-lea ciclu
