@@ -512,12 +512,7 @@ static bool showSplashAndCheckBoot() {
     tft.drawString("1.2 12V BZG", TFT_W / 2, TFT_H / 2 + 22);
   }
 
-  // indiciu jos, cu fundal ca sa se citeasca si peste poza
-  tft.setFont(&fonts::Font2);
-  tft.setTextDatum(bottom_center);
-  tft.setTextColor(rgb565(cfgFg), rgb565(cfgBg));
-  tft.drawString(" Tine apasat BOOT pentru setari ", TFT_W / 2, TFT_H - 2);
-
+  // (fara text de indiciu - butonul BOOT functioneaza in continuare, doar nu mai e afisat)
   uint32_t start = millis();
   uint32_t pressStart = 0;
   // daca butonul e apasat cand expira timpul, mai asteptam pana se implineste 1s
