@@ -121,7 +121,7 @@ const ParamDef PARAMS[] = {
 };
 const uint8_t PARAM_COUNT = sizeof(PARAMS) / sizeof(PARAMS[0]);
 
-#define MAX_SLOTS 8
+#define MAX_SLOTS 9   // grila maxima 3 x 3
 #define SLOT_HAS_MIN 0x01
 #define SLOT_HAS_MAX 0x02
 
@@ -133,14 +133,18 @@ struct SlotCfg {
   float vmax;      // peste maxim -> culoare de avertizare
 };
 
-// O casuta afisata (obiectele LVGL). Bold-ul e simulat cu o a doua eticheta
-// decalata cu 1px (fonturile LVGL incluse nu au varianta bold).
+// O casuta afisata (obiectele LVGL)
 struct Cell {
   lv_obj_t *title;
-  lv_obj_t *titleB;   // copia pentru bold (nullptr daca nu e bold)
   lv_obj_t *val;
-  lv_obj_t *valB;
+  lv_obj_t *line;   // linia de sub valoare (stil afisaj LCD de bord)
 };
+
+// Fonturi stil LCD de bord (pixelate, ingrosate) - generate in lcd_fonts.c
+LV_FONT_DECLARE(lcd_font_16);   // titluri, status
+LV_FONT_DECLARE(lcd_font_24);   // valori (3 coloane), coduri de eroare
+LV_FONT_DECLARE(lcd_font_32);   // valori (2 coloane)
+LV_FONT_DECLARE(lcd_font_40);   // valori (1 coloana)
 
 /******************** CODURI DE EROARE (DTC) ********************/
 struct Dtc {
@@ -207,10 +211,6 @@ uint32_t cfgBg = 0x00FF00;   // fundal verde
 uint32_t cfgFg = 0x000000;   // scris negru
 uint32_t cfgWarn = 0xFF0000; // culoare de avertizare (valoare in afara limitelor)
 SlotCfg cfgSlots[MAX_SLOTS];
-uint8_t cfgValSize = 0;        // marime cifre in px (10-48), 0 = automat dupa numarul de casute
-uint8_t cfgTitleSize = 0;      // marime titluri in px (10-48), 0 = automat
-bool cfgValBold = false;
-bool cfgTitleBold = false;
 
 // PID-uri suportate de ECU (raspunsurile la 0100 / 0120 / 0140), salvate la prima conectare
 uint32_t supMask[3] = { 0, 0, 0 };
@@ -282,9 +282,9 @@ static uint16_t rgb565(uint32_t c) {
 }
 
 /******************** SETARI (NVS) ********************/
-// Casutele implicite = cele 8 valori de pana acum, cu cateva limite utile
+// Casutele implicite = cele 8 valori de pana acum (a 9-a goala), cu cateva limite utile
 static void defaultSlots() {
-  const uint8_t def[MAX_SLOTS] = { 1, 3, 2, 5, 4, 6, 7, P_BATTERY };
+  const uint8_t def[MAX_SLOTS] = { 1, 3, 2, 5, 4, 6, 7, P_BATTERY, P_NONE };
   for (int i = 0; i < MAX_SLOTS; i++) cfgSlots[i] = { def[i], 0, 0.0f, 0.0f };
   cfgSlots[1].flags = SLOT_HAS_MAX;                cfgSlots[1].vmax = 105.0f;   // COOLANT > 105 C
   cfgSlots[7].flags = SLOT_HAS_MIN | SLOT_HAS_MAX; cfgSlots[7].vmin = 11.8f;    // BATTERY < 11.8 V
@@ -296,14 +296,13 @@ static void loadSettings() {
   cfgBg = prefs.getUInt("bg", cfgBg);
   cfgFg = prefs.getUInt("fg", cfgFg);
   cfgWarn = prefs.getUInt("wc", cfgWarn);
-  cfgValSize = prefs.getUChar("vs", cfgValSize);
-  cfgTitleSize = prefs.getUChar("ts", cfgTitleSize);
-  cfgValBold = prefs.getBool("vb", cfgValBold);
-  cfgTitleBold = prefs.getBool("tb", cfgTitleBold);
 
   defaultSlots();
-  if (prefs.getBytesLength("slots") == sizeof(cfgSlots)) {
-    prefs.getBytes("slots", cfgSlots, sizeof(cfgSlots));
+  size_t slotBytes = prefs.getBytesLength("slots");
+  // accepta si setarile vechi cu 8 casute (a 9-a ramane goala)
+  if (slotBytes == sizeof(cfgSlots) || slotBytes == 8 * sizeof(SlotCfg)) {
+    if (slotBytes != sizeof(cfgSlots)) cfgSlots[MAX_SLOTS - 1] = { P_NONE, 0, 0.0f, 0.0f };
+    prefs.getBytes("slots", cfgSlots, slotBytes);
     for (auto &s : cfgSlots) if (s.param >= PARAM_COUNT) s.param = P_NONE;
   }
 
@@ -324,10 +323,6 @@ static void saveSettings() {
   prefs.putUInt("bg", cfgBg);
   prefs.putUInt("fg", cfgFg);
   prefs.putUInt("wc", cfgWarn);
-  prefs.putUChar("vs", cfgValSize);
-  prefs.putUChar("ts", cfgTitleSize);
-  prefs.putBool("vb", cfgValBold);
-  prefs.putBool("tb", cfgTitleBold);
   prefs.putBytes("slots", cfgSlots, sizeof(cfgSlots));
   prefs.end();
 }
@@ -374,36 +369,22 @@ Cell cells[MAX_SLOTS];
 uint8_t activeSlot[MAX_SLOTS];   // pentru fiecare casuta afisata: indexul ei in cfgSlots
 uint8_t activeCount = 0;
 
-// Fonturile Montserrat activate in lv_conf.h (10..48, din 2 in 2)
-static const lv_font_t *fontBySize(uint8_t px) {
-  switch (px) {
-    case 10: return &lv_font_montserrat_10;
-    case 12: return &lv_font_montserrat_12;
-    case 14: return &lv_font_montserrat_14;
-    case 16: return &lv_font_montserrat_16;
-    case 18: return &lv_font_montserrat_18;
-    case 20: return &lv_font_montserrat_20;
-    case 22: return &lv_font_montserrat_22;
-    case 24: return &lv_font_montserrat_24;
-    case 26: return &lv_font_montserrat_26;
-    case 28: return &lv_font_montserrat_28;
-    case 30: return &lv_font_montserrat_30;
-    case 32: return &lv_font_montserrat_32;
-    case 34: return &lv_font_montserrat_34;
-    case 36: return &lv_font_montserrat_36;
-    case 38: return &lv_font_montserrat_38;
-    case 40: return &lv_font_montserrat_40;
-    case 42: return &lv_font_montserrat_42;
-    case 44: return &lv_font_montserrat_44;
-    case 46: return &lv_font_montserrat_46;
-    case 48: return &lv_font_montserrat_48;
-    default: return &lv_font_montserrat_14;
-  }
+// Marimea valorilor depinde doar de cate coloane are grila (fix, nu se mai alege din pagina)
+static const lv_font_t *valueFontFor(uint8_t cols) {
+  return cols <= 1 ? &lcd_font_40 : cols == 2 ? &lcd_font_32 : &lcd_font_24;
 }
 
-// Marimi automate: cea mai mare care incape in latimea casutei
-static uint8_t autoValSize(uint8_t cols)   { return cols <= 1 ? 48 : cols == 2 ? 44 : cols == 3 ? 32 : 24; }
-static uint8_t autoTitleSize(uint8_t cols) { return cols <= 2 ? 16 : cols == 3 ? 14 : 12; }
+// Linie plina (bara de sub valoare)
+static lv_obj_t *mkBar(lv_obj_t *parent, int x, int y, int w, int h) {
+  lv_obj_t *b = lv_obj_create(parent);
+  lv_obj_remove_style_all(b);
+  lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
+  lv_obj_set_style_bg_color(b, lv_color_hex(cfgFg), 0);
+  lv_obj_set_pos(b, x, y);
+  lv_obj_set_size(b, w, h);
+  lv_obj_clear_flag(b, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+  return b;
+}
 
 static lv_obj_t *mkLabel(lv_obj_t *parent, const char *txt, const lv_font_t *f, int x, int y) {
   lv_obj_t *l = lv_label_create(parent);
@@ -422,21 +403,21 @@ static void create_dashboard() {
 
   lv_style_init(&style_status);
   lv_style_set_text_color(&style_status, lv_color_hex(cfgFg));
-  lv_style_set_text_font(&style_status, &lv_font_montserrat_14);
+  lv_style_set_text_font(&style_status, &lcd_font_16);
   lv_style_set_bg_opa(&style_status, LV_OPA_TRANSP);
   lv_style_set_border_width(&style_status, 0);
 
   lbl_status = lv_label_create(scr);
-  lv_label_set_text(lbl_status, "Pornire...");
+  lv_label_set_text(lbl_status, "PORNIRE...");
   lv_obj_add_style(lbl_status, &style_status, 0);
-  lv_obj_set_pos(lbl_status, 5, 4);
-  lv_obj_set_width(lbl_status, 225);                     // loc in dreapta pentru indicatorul de erori
+  lv_obj_set_pos(lbl_status, 4, 4);
+  lv_obj_set_width(lbl_status, 208);                     // loc in dreapta pentru indicatorul de erori
   lv_label_set_long_mode(lbl_status, LV_LABEL_LONG_CLIP);
 
   // indicator erori (gol cat timp nu sunt erori)
-  lbl_dtc_badge = mkLabel(scr, "", &lv_font_montserrat_14, 0, 4);
+  lbl_dtc_badge = mkLabel(scr, "", &lcd_font_16, 0, 4);
   lv_obj_set_style_text_color(lbl_dtc_badge, lv_color_hex(cfgWarn), 0);
-  lv_obj_align(lbl_dtc_badge, LV_ALIGN_TOP_RIGHT, -5, 4);
+  lv_obj_align(lbl_dtc_badge, LV_ALIGN_TOP_RIGHT, -4, 4);
 
   // casutele alese in setari, in ordine, fara cele goale
   activeCount = 0;
@@ -444,45 +425,39 @@ static void create_dashboard() {
     if (cfgSlots[i].param != P_NONE) activeSlot[activeCount++] = i;
 
   if (activeCount == 0) {
-    mkLabel(scr, "Niciun parametru ales.\nIntra in setari (BOOT la pornire).", &lv_font_montserrat_16, 10, 100);
+    mkLabel(scr, "NICIUN PARAMETRU\nALES - INTRA IN\nSETARI (BOOT)", &lcd_font_24, 10, 70);
     return;
   }
 
-  // aranjament automat dupa numarul de casute
+  // aranjament automat dupa numarul de casute (maxim 3 x 3)
   uint8_t cols, rows;
   if (activeCount == 1)      { cols = 1; rows = 1; }
   else if (activeCount == 2) { cols = 2; rows = 1; }
   else if (activeCount <= 4) { cols = 2; rows = 2; }
   else if (activeCount <= 6) { cols = 3; rows = 2; }
-  else                       { cols = 4; rows = 2; }
+  else                       { cols = 3; rows = 3; }
 
   const int top = 24;   // sub randul de status
   const int cw = TFT_W / cols;
   const int ch = (TFT_H - top) / rows;
-  const lv_font_t *tf = fontBySize(cfgTitleSize ? cfgTitleSize : autoTitleSize(cols));
-  const lv_font_t *vf = fontBySize(cfgValSize ? cfgValSize : autoValSize(cols));
+  const lv_font_t *tf = &lcd_font_16;
+  const lv_font_t *vf = valueFontFor(cols);
   const int th = lv_font_get_line_height(tf);
   const int vh = lv_font_get_line_height(vf);
+  const int block = th + 4 + vh + 2 + 2;   // titlu + spatiu + valoare + spatiu + linie
+  const int offY = max(0, (ch - block) / 2);
 
   for (uint8_t ci = 0; ci < activeCount; ci++) {
     uint8_t id = cfgSlots[activeSlot[ci]].param;
-    const ParamDef &p = PARAMS[id];
-    int x = (ci % cols) * cw + 6;
-    int y = top + (ci / cols) * ch + 4;
+    int x = (ci % cols) * cw + 4;
+    int y = top + (ci / cols) * ch + offY;
+    int vy = y + th + 4;
 
-    char title[24];
-    if (p.unit[0]) snprintf(title, sizeof(title), "%s %s", p.name, p.unit);
-    else snprintf(title, sizeof(title), "%s", p.name);
-
-    // valoarea centrata vertical in spatiul ramas sub titlu
-    int vy = y + th + max(0, (ch - 8 - th - vh) / 2);
-    const char *init = paramSupported(id) ? "--" : "n/a";
-
+    // ca pe afisajele de bord: titlul fara unitate de masura
     Cell &c = cells[ci];
-    c.titleB = cfgTitleBold ? mkLabel(scr, title, tf, x + 1, y) : nullptr;
-    c.title  = mkLabel(scr, title, tf, x, y);
-    c.valB   = cfgValBold ? mkLabel(scr, init, vf, x + 1, vy) : nullptr;
-    c.val    = mkLabel(scr, init, vf, x, vy);
+    c.title = mkLabel(scr, PARAMS[id].name, tf, x, y);
+    c.val   = mkLabel(scr, paramSupported(id) ? "--" : "N/A", vf, x, vy);
+    c.line  = mkBar(scr, x, vy + vh + 2, cw - 14, 2);
   }
 }
 
@@ -493,20 +468,21 @@ static void create_error_screen() {
   lv_obj_set_style_bg_opa(scr_err, LV_OPA_COVER, 0);
   lv_obj_clear_flag(scr_err, LV_OBJ_FLAG_SCROLLABLE);
 
-  mkLabel(scr_err, "ERORI MOTOR", &lv_font_montserrat_22, 8, 4);
-  lbl_err_info = mkLabel(scr_err, "", &lv_font_montserrat_14, 8, 34);
-  lv_obj_set_width(lbl_err_info, TFT_W - 16);
+  mkLabel(scr_err, "ERORI MOTOR", &lcd_font_24, 4, 4);
+  mkBar(scr_err, 4, 30, TFT_W - 8, 2);
+  lbl_err_info = mkLabel(scr_err, "", &lcd_font_16, 4, 36);
+  lv_obj_set_width(lbl_err_info, TFT_W - 8);
   lv_label_set_long_mode(lbl_err_info, LV_LABEL_LONG_CLIP);
 
-  lbl_err_list = mkLabel(scr_err, "", &lv_font_montserrat_20, 8, 70);
+  lbl_err_list = mkLabel(scr_err, "", &lcd_font_24, 4, 100);
 
   // grila de coduri: 3 coloane x 6 randuri (incap toate cele MAX_DTC = 16)
   for (uint8_t i = 0; i < MAX_DTC; i++) {
-    lbl_codes[i] = mkLabel(scr_err, "", &lv_font_montserrat_24, 8 + (i % 3) * 104, 60 + (i / 3) * 26);
+    lbl_codes[i] = mkLabel(scr_err, "", &lcd_font_24, 2 + (i % 3) * 106, 58 + (i / 3) * 26);
     lv_obj_set_style_text_color(lbl_codes[i], lv_color_hex(cfgWarn), 0);
   }
 
-  mkLabel(scr_err, "BOOT = inapoi      ? = eroare in asteptare", &lv_font_montserrat_12, 8, TFT_H - 18);
+  mkLabel(scr_err, "BOOT=INAPOI ?=ASTEPTARE", &lcd_font_16, 4, TFT_H - 18);
 }
 
 static void refreshErrorScreen() {
@@ -515,11 +491,12 @@ static void refreshErrorScreen() {
   // randul de info: starea conexiunii + martor + cand am citit
   char info[64];
   if (!dtcKnown) {
-    snprintf(info, sizeof(info), "%s", elmEcuOk ? "Citesc erorile..." : "Nu sunt conectat la ECU");
+    snprintf(info, sizeof(info), "%s", elmEcuOk ? "CITESC ERORILE..." : "NECONECTAT LA ECU");
+  } else if (elmEcuOk) {
+    snprintf(info, sizeof(info), "MARTOR: %s  ACUM %uS", milOn ? "APRINS" : "STINS",
+             (unsigned)((millis() - dtcReadAt) / 1000));
   } else {
-    uint32_t ago = (millis() - dtcReadAt) / 1000;
-    snprintf(info, sizeof(info), "Martor motor: %s  |  citit acum %us%s",
-             milOn ? "APRINS" : "stins", (unsigned)ago, elmEcuOk ? "" : " (deconectat)");
+    snprintf(info, sizeof(info), "MARTOR: %s (DECONECTAT)", milOn ? "APRINS" : "STINS");
   }
   lv_label_set_text(lbl_err_info, info);
 
@@ -534,7 +511,7 @@ static void refreshErrorScreen() {
       lv_label_set_text(lbl_codes[i], "");
     }
   }
-  lv_label_set_text(lbl_err_list, (dtcKnown && dtcCount == 0) ? LV_SYMBOL_OK "  Nicio eroare" : "");
+  lv_label_set_text(lbl_err_list, (dtcKnown && dtcCount == 0) ? "NICIO EROARE" : "");
 }
 
 // Indicatorul de pe ecranul live
@@ -542,12 +519,12 @@ static void updateDtcBadge() {
   if (!lbl_dtc_badge) return;
   if (dtcKnown && dtcCount > 0) {
     char b[24];
-    snprintf(b, sizeof(b), LV_SYMBOL_WARNING " %u %s", dtcCount, dtcCount == 1 ? "EROARE" : "ERORI");
+    snprintf(b, sizeof(b), "!%u %s", dtcCount, dtcCount == 1 ? "EROARE" : "ERORI");
     lv_label_set_text(lbl_dtc_badge, b);
   } else {
     lv_label_set_text(lbl_dtc_badge, "");
   }
-  lv_obj_align(lbl_dtc_badge, LV_ALIGN_TOP_RIGHT, -5, 4);
+  lv_obj_align(lbl_dtc_badge, LV_ALIGN_TOP_RIGHT, -4, 4);
 }
 
 void IRAM_ATTR onBootPress() {
@@ -577,15 +554,13 @@ static bool checkScreenToggle() {
 
 static void setCellText(Cell &c, const char *txt) {
   lv_label_set_text(c.val, txt);
-  if (c.valB) lv_label_set_text(c.valB, txt);
 }
 
 static void setCellColor(Cell &c, uint32_t rgb) {
   lv_color_t k = lv_color_hex(rgb);
   lv_obj_set_style_text_color(c.val, k, 0);
   lv_obj_set_style_text_color(c.title, k, 0);
-  if (c.valB) lv_obj_set_style_text_color(c.valB, k, 0);
-  if (c.titleB) lv_obj_set_style_text_color(c.titleB, k, 0);
+  lv_obj_set_style_bg_color(c.line, k, 0);
 }
 
 static void formatValue(const ParamDef &p, float v, char *buf, size_t n) {
@@ -619,8 +594,26 @@ static void showValue(uint8_t ci, bool ok, float v) {
 }
 
 static void set_status(const String &s) {
-  lv_label_set_text(lbl_status, s.c_str());
+  String up = s;
+  up.toUpperCase();   // stil afisaj de bord: totul cu majuscule
+  lv_label_set_text(lbl_status, up.c_str());
   Serial.println(s);
+}
+
+/******************** TEXT STIL LCD (desenat direct, fara LVGL) ********************/
+// Acelasi font 5x7 ca lcd_fonts.c, marit de `size` ori si ingrosat cu 1px,
+// pentru ecranele desenate direct (start, mod setari, previzualizare).
+static void lcdText(const String &s, int x, int y, uint8_t size, uint32_t rgb,
+                    textdatum_t datum = top_left, bool upper = true) {
+  String up = s;
+  if (upper) up.toUpperCase();
+  tft.setFont(&fonts::Font0);
+  tft.setTextSize(size);
+  tft.setTextDatum(datum);
+  tft.setTextColor(rgb565(rgb));
+  tft.drawString(up, x, y);
+  tft.drawString(up, x + 1, y);   // ingrosare
+  tft.setTextSize(1);
 }
 
 /******************** IMAGINE DE START ********************/
@@ -635,12 +628,8 @@ static bool showSplashAndCheckBoot() {
     if (!drawn) Serial.println("[SPLASH] imaginea nu a putut fi desenata");
   }
   if (!drawn) {
-    tft.setTextColor(rgb565(cfgFg));
-    tft.setTextDatum(middle_center);
-    tft.setFont(&fonts::FreeSansBold18pt7b);
-    tft.drawString("Skoda Fabia", TFT_W / 2, TFT_H / 2 - 12);
-    tft.setFont(&fonts::FreeSans9pt7b);
-    tft.drawString("1.2 12V BZG", TFT_W / 2, TFT_H / 2 + 22);
+    lcdText("Skoda Fabia", TFT_W / 2, TFT_H / 2 - 14, 4, cfgFg, middle_center);
+    lcdText("1.2 12V BZG", TFT_W / 2, TFT_H / 2 + 24, 2, cfgFg, middle_center);
   }
 
   // (fara text de indiciu - butonul BOOT functioneaza in continuare, doar nu mai e afisat)
@@ -660,47 +649,38 @@ static bool showSplashAndCheckBoot() {
 }
 
 /******************** MOD SETARI - ECRAN ********************/
+// Max ~25 caractere pe rand la marimea 2
 static void drawConfigScreen(const char *footer) {
-  tft.fillScreen(tft.color565(20, 20, 20));
-  tft.setTextDatum(top_left);
-  tft.setTextColor(TFT_WHITE);
-  tft.setFont(&fonts::FreeSansBold12pt7b);
-  tft.drawString("MOD SETARI", 10, 8);
+  tft.fillScreen(rgb565(cfgBg));
+  lcdText("MOD SETARI", 4, 6, 3, cfgFg);
+  tft.fillRect(4, 32, TFT_W - 8, 2, rgb565(cfgFg));
 
-  tft.setFont(&fonts::FreeSans9pt7b);
-  tft.drawString("1. Conecteaza telefonul la WiFi:", 10, 48);
-  tft.setTextColor(TFT_YELLOW);
-  tft.drawString("   " AP_SSID "   parola: " AP_PASS, 10, 70);
-  tft.setTextColor(TFT_WHITE);
-  tft.drawString("2. Pagina se deschide singura, sau:", 10, 102);
-  tft.setTextColor(TFT_YELLOW);
-  tft.drawString("   http://192.168.4.1", 10, 124);
-  tft.setTextColor(TFT_WHITE);
-  tft.drawString("BOOT = iesire fara salvare", 10, 164);
+  lcdText("1. WIFI PE TELEFON:", 4, 42, 2, cfgFg);
+  lcdText("   " AP_SSID, 4, 62, 2, cfgWarn, top_left, false);   // numele retelei e sensibil la majuscule
+  lcdText("   PAROLA " AP_PASS, 4, 82, 2, cfgWarn);
+  lcdText("2. PAGINA SE DESCHIDE", 4, 106, 2, cfgFg);
+  lcdText("   SINGURA, SAU:", 4, 126, 2, cfgFg);
+  lcdText("   192.168.4.1", 4, 146, 2, cfgWarn);
+  lcdText("BOOT = IESIRE", 4, 174, 2, cfgFg);
 
-  tft.setFont(&fonts::Font2);
-  tft.setTextColor(TFT_CYAN);
-  tft.drawString(footer, 10, TFT_H - 22);
+  tft.fillRect(4, TFT_H - 26, TFT_W - 8, 2, rgb565(cfgFg));
+  lcdText(footer, 4, TFT_H - 20, 2, cfgFg);
 }
 
 // Previzualizare culori direct pe display, cat timp le alegi din telefon
 static void drawColorPreview(uint32_t bg, uint32_t fg, uint32_t wc) {
   tft.fillScreen(rgb565(bg));
-  tft.setTextDatum(top_left);
-  tft.setTextColor(rgb565(fg));
-  tft.setFont(&fonts::FreeSans9pt7b);
-  tft.drawString("Previzualizare culori (nesalvat)", 5, 4);
-  tft.drawString("RPM", 5, 40);
-  tft.setFont(&fonts::FreeSansBold18pt7b);
-  tft.drawString("2500", 5, 62);
-  tft.setTextColor(rgb565(wc));
-  tft.setFont(&fonts::FreeSans9pt7b);
-  tft.drawString("COOLANT C", 165, 40);
-  tft.setFont(&fonts::FreeSansBold18pt7b);
-  tft.drawString("112", 165, 62);
-  tft.setTextColor(rgb565(fg));
-  tft.setFont(&fonts::Font2);
-  tft.drawString("Apasa Salveaza in pagina ca sa pastrezi setarile", 5, TFT_H - 22);
+  lcdText("PREVIZUALIZARE", 4, 4, 2, fg);
+
+  lcdText("RPM", 4, 40, 2, fg);
+  lcdText("2500", 4, 60, 3, fg);
+  tft.fillRect(4, 86, 92, 2, rgb565(fg));
+
+  lcdText("COOLANT", 110, 40, 2, wc);   // exemplu de valoare in afara limitelor
+  lcdText("112", 110, 60, 3, wc);
+  tft.fillRect(110, 86, 92, 2, rgb565(wc));
+
+  lcdText("SALVEAZA IN PAGINA", 4, TFT_H - 20, 2, fg);
 }
 
 /******************** MOD SETARI - PAGINA WEB ********************/
@@ -718,8 +698,9 @@ h2{font-size:16px;margin:0 0 12px;color:#9cf}
 .row label{flex:1}
 input[type=color]{width:56px;height:40px;border:none;padding:0;background:none}
 input[type=text]{width:88px;padding:8px;border-radius:8px;border:1px solid #444;background:#000;color:#eee;font-family:monospace}
-#prev{position:relative;aspect-ratio:4/3;border-radius:8px;overflow:hidden;font-family:Montserrat,Arial,sans-serif}
-#prev div{position:absolute;white-space:nowrap;line-height:1.15}
+#prev{position:relative;aspect-ratio:4/3;border-radius:8px;overflow:hidden;font-family:'Courier New',monospace;font-weight:bold}
+#prev div{position:absolute;white-space:nowrap;line-height:1;text-transform:uppercase}
+#prev .bar{height:2px}
 #wex{margin-top:8px;font-weight:bold}
 select{flex:1;min-width:0;padding:8px;border-radius:8px;border:1px solid #444;background:#000;color:#eee;font-size:15px}
 input[type=checkbox]{width:24px;height:24px}
@@ -744,20 +725,12 @@ small{color:#999}
 <section><h2>Previzualizare ecran</h2>
 <div id="prev"></div>
 <div id="wex">Exemplu valoare în afara limitelor: 112</div>
-<small>Aproximativ &ndash; pe display fontul arată puțin diferit.</small>
-</section>
-
-<section><h2>Mărime și stil text</h2>
-<div class="row"><label for="vs">Mărime valori</label><select id="vs"></select></div>
-<div class="row"><label for="ts">Mărime titluri</label><select id="ts"></select></div>
-<div class="row"><label for="vb">Valori bold</label><input type="checkbox" id="vb"></div>
-<div class="row"><label for="tb">Titluri bold</label><input type="checkbox" id="tb"></div>
-<small>„Automat” alege cea mai mare mărime care încape în căsuță. Dacă alegi mai mare, textul poate ieși din căsuță &ndash; verifică în previzualizare.</small>
+<small>Aproximativ &ndash; pe display literele sunt pixelate (stil afișaj de bord).</small>
 </section>
 
 <section><h2>Parametri afișați</h2>
 <div id="slots"></div>
-<small>Ecranul se aranjează singur după câte căsuțe folosești (1&ndash;8). Cu mai puține căsuțe, valorile se actualizează mai des. Min / max sunt opționale: când valoarea iese din interval, căsuța devine în culoarea de avertizare.</small><br>
+<small>Ecranul se aranjează singur după câte căsuțe folosești (1&ndash;9, maxim 3 &times; 3). Cu mai puține căsuțe, valorile se actualizează mai des. Min / max sunt opționale: când valoarea iese din interval, căsuța devine în culoarea de avertizare.</small><br>
 <small id="supnote"></small>
 </section>
 <section><h2>Imagine de start</h2>
@@ -776,29 +749,30 @@ const $=id=>document.getElementById(id);
 const msg=t=>$('msg').textContent=t;
 let timer,blob=null,P=[];
 const SAMPLE=['88','12.5','0.45','12:34'];   // exemplu de valoare dupa format (int, 1 zecimala, 2 zecimale, mm:ss)
-function fillSize(id){const s=$(id);s.add(new Option('Automat',0));for(let n=10;n<=48;n+=2)s.add(new Option(n+' px',n));}
-fillSize('vs');fillSize('ts');
-function body(){const b=new URLSearchParams({bg:$('bg').value,fg:$('fg').value,wc:$('wc').value,
- vs:$('vs').value,ts:$('ts').value,vb:$('vb').checked?1:0,tb:$('tb').checked?1:0});
- for(let i=0;i<8;i++){if(!$('s'+i))break;b.append('s'+i,$('s'+i).value);b.append('n'+i,$('n'+i).value);b.append('x'+i,$('x'+i).value);}
+const NS=9;                                  // numar de casute (grila maxima 3 x 3)
+function body(){const b=new URLSearchParams({bg:$('bg').value,fg:$('fg').value,wc:$('wc').value});
+ for(let i=0;i<NS;i++){if(!$('s'+i))break;b.append('s'+i,$('s'+i).value);b.append('n'+i,$('n'+i).value);b.append('x'+i,$('x'+i).value);}
  return b;}
 function sendPreview(){clearTimeout(timer);timer=setTimeout(()=>fetch('/preview',{method:'POST',body:body()}),300);}
+// Previzualizare cu acelasi aranjament ca pe display. Fontul de pe display are
+// 6*s px latime pe caracter si 8*s px inaltime (s = marirea fontului 5x7).
 function render(){const p=$('prev'),fg=$('fg').value;p.style.background=$('bg').value;p.innerHTML='';
  $('wex').style.color=$('wc').value;
  const k=p.clientWidth/320;
- function add(t,x,y,s,b,col){const d=document.createElement('div');d.textContent=t;d.style.left=x*k+'px';d.style.top=y*k+'px';
-  d.style.fontSize=s*k+'px';d.style.fontWeight=b?'bold':'normal';d.style.color=col;p.appendChild(d);}
- const act=[];for(let i=0;i<8;i++){const e=$('s'+i);if(e&&+e.value)act.push(+e.value);}
- add('OK - live',5,4,14,false,fg);
- const n=act.length;if(!n){add('Niciun parametru ales',10,100,16,false,fg);return;}
- let c,r;if(n==1){c=1;r=1}else if(n==2){c=2;r=1}else if(n<=4){c=2;r=2}else if(n<=6){c=3;r=2}else{c=4;r=2}
- const vs=+$('vs').value||(c<=1?48:c==2?44:c==3?32:24),ts=+$('ts').value||(c<=2?16:c==3?14:12);
- const cw=320/c,chh=(240-24)/r,th=ts*1.2,vh=vs*1.2;
- act.forEach((id,i)=>{const q=P[id],x=(i%c)*cw+6,y=24+Math.floor(i/c)*chh+4,vy=y+th+Math.max(0,(chh-8-th-vh)/2);
-  add(q.n+(q.u?' '+q.u:''),x,y,ts,$('tb').checked,fg);add(q.s?SAMPLE[q.f]:'n/a',x,vy,vs,$('vb').checked,fg);});}
+ function add(t,x,y,s,col){const d=document.createElement('div');d.textContent=t;d.style.left=x*k+'px';d.style.top=y*k+'px';
+  d.style.fontSize=(10*s*k)+'px';d.style.color=col;p.appendChild(d);}
+ function bar(x,y,w,col){const d=document.createElement('div');d.className='bar';d.style.left=x*k+'px';d.style.top=y*k+'px';
+  d.style.width=w*k+'px';d.style.background=col;p.appendChild(d);}
+ const act=[];for(let i=0;i<NS;i++){const e=$('s'+i);if(e&&+e.value)act.push(+e.value);}
+ add('LIVE 5/5',4,4,2,fg);
+ const n=act.length;if(!n){add('Niciun parametru',10,100,3,fg);return;}
+ let c,r;if(n==1){c=1;r=1}else if(n==2){c=2;r=1}else if(n<=4){c=2;r=2}else if(n<=6){c=3;r=2}else{c=3;r=3}
+ const vs=c<=1?5:c==2?4:3,cw=Math.floor(320/c),chh=Math.floor(216/r),th=16,vh=8*vs,blk=th+4+vh+4,oy=Math.max(0,Math.floor((chh-blk)/2));
+ act.forEach((id,i)=>{const q=P[id],x=(i%c)*cw+4,y=24+Math.floor(i/c)*chh+oy,vy=y+th+4;
+  add(q.n,x,y,2,fg);add(q.s?SAMPLE[q.f]:'N/A',x,vy,vs,fg);bar(x,vy+vh+2,cw-14,fg);});}
 function limVis(i){$('n'+i).parentNode.style.display=$('s'+i).value=='0'?'none':'flex';}
 function buildSlots(slots){const box=$('slots');box.innerHTML='';
- for(let i=0;i<8;i++){const d=document.createElement('div');d.className='slot';
+ for(let i=0;i<NS;i++){const d=document.createElement('div');d.className='slot';
   d.innerHTML='<label for="s'+i+'">Căsuța '+(i+1)+'</label><select id="s'+i+'"></select>'+
    '<div class="lim"><input type="number" step="any" id="n'+i+'" placeholder="min"><input type="number" step="any" id="x'+i+'" placeholder="max"></div>';
   box.appendChild(d);
@@ -811,12 +785,10 @@ function buildSlots(slots){const box=$('slots');box.innerHTML='';
  $(k+'h').addEventListener('change',()=>{let v=$(k+'h').value.trim();if(v[0]!='#')v='#'+v;
   if(/^#[0-9a-fA-F]{6}$/.test(v)){$(k).value=v.toLowerCase();$(k+'h').value=$(k).value;render();sendPreview();}else $(k+'h').value=$(k).value;});
 });
-['vs','ts','vb','tb'].forEach(k=>$(k).addEventListener('change',render));
 window.addEventListener('resize',render);
 function showCur(){$('cur').src='/splash.jpg?'+Date.now();$('cur').style.display='block';$('del').style.display='block';}
 async function load(){try{const c=await (await fetch('/config')).json();P=c.params;
  ['bg','fg','wc'].forEach(k=>{$(k).value=c[k];$(k+'h').value=c[k];});
- $('vs').value=c.vs;$('ts').value=c.ts;$('vb').checked=c.vb;$('tb').checked=c.tb;
  buildSlots(c.slots);
  $('supnote').textContent=c.sup?'„✕ nesuportat” = calculatorul mașinii a raportat că nu are acest parametru (pe ecran apare n/a).'
   :'Lista parametrilor suportați de mașină apare după prima conectare la ECU.';
@@ -858,9 +830,8 @@ static void handleGetConfig() {
   String j;
   j.reserve(2600);
   snprintf(tmp, sizeof(tmp),
-           "{\"bg\":\"#%06x\",\"fg\":\"#%06x\",\"wc\":\"#%06x\",\"vs\":%u,\"ts\":%u,\"vb\":%s,\"tb\":%s,\"img\":%s,\"sup\":%s,",
-           (unsigned)cfgBg, (unsigned)cfgFg, (unsigned)cfgWarn, cfgValSize, cfgTitleSize,
-           cfgValBold ? "true" : "false", cfgTitleBold ? "true" : "false",
+           "{\"bg\":\"#%06x\",\"fg\":\"#%06x\",\"wc\":\"#%06x\",\"img\":%s,\"sup\":%s,",
+           (unsigned)cfgBg, (unsigned)cfgFg, (unsigned)cfgWarn,
            img ? "true" : "false", supKnown ? "true" : "false");
   j += tmp;
 
@@ -898,13 +869,6 @@ static void handlePreview() {
   server->send(200, "text/plain", "ok");
 }
 
-// marime font valida: 0 (automat) sau numar par 10..48
-static uint8_t parseFontSize(const String &s) {
-  int v = s.toInt();
-  if (v < 10 || v > 48) return 0;
-  return (uint8_t)(v & ~1);
-}
-
 static void handleSave() {
   uint32_t bg, fg, wc = cfgWarn;
   if (!parseColor(server->arg("bg"), bg) || !parseColor(server->arg("fg"), fg)) {
@@ -915,10 +879,6 @@ static void handleSave() {
   cfgBg = bg;
   cfgFg = fg;
   cfgWarn = wc;
-  cfgValSize = parseFontSize(server->arg("vs"));
-  cfgTitleSize = parseFontSize(server->arg("ts"));
-  cfgValBold = server->arg("vb") == "1";
-  cfgTitleBold = server->arg("tb") == "1";
 
   if (server->hasArg("s0")) {
     for (uint8_t i = 0; i < MAX_SLOTS; i++) {
@@ -936,7 +896,7 @@ static void handleSave() {
   saveSettings();
   Serial.printf("[CFG] Salvat: fundal #%06X, scris #%06X -> repornire\n", (unsigned)cfgBg, (unsigned)cfgFg);
   server->send(200, "text/plain", "ok");
-  drawConfigScreen("Salvat! Repornire...");
+  drawConfigScreen("SALVAT! REPORNIRE...");
   delay(800);   // lasam raspunsul sa ajunga la telefon
   ESP.restart();
 }
@@ -997,7 +957,7 @@ static void handleUploadDone() {
 static void handleDeleteImage() {
   if (fsOk) LittleFS.remove(SPLASH_PATH);
   server->send(200, "text/plain", "ok");
-  drawConfigScreen("Imaginea de start a fost stearsa");
+  drawConfigScreen("IMAGINE STEARSA");
 }
 
 // Orice alta adresa (ex. verificarile automate de internet ale iPhone/Android)
@@ -1010,7 +970,7 @@ static void handleNotFound() {
 static void startConfigMode() {
   configMode = true;
   Serial.println("[CFG] Intru in MOD SETARI (Bluetooth oprit, WiFi pornit)");
-  drawConfigScreen("Pornesc WiFi...");
+  drawConfigScreen("PORNESC WIFI...");
 
   // asteptam sa fie eliberat butonul, ca apasarea de intrare sa nu fie luata drept iesire
   while (digitalRead(BOOT_PIN) == LOW) delay(10);
@@ -1033,7 +993,7 @@ static void startConfigMode() {
   server->begin();
 
   Serial.printf("[CFG] WiFi '%s' pornit, IP %s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
-  drawConfigScreen(fsOk ? "Astept telefonul..." : "ATENTIE: LittleFS indisponibil - doar culori");
+  drawConfigScreen(fsOk ? "ASTEPT TELEFONUL..." : "FARA MEMORIE IMAGINI");
 }
 
 static void configLoop() {
@@ -1053,7 +1013,7 @@ static void configLoop() {
   if (digitalRead(BOOT_PIN) == LOW) {
     if (!pressStart) pressStart = millis();
     else if (millis() - pressStart > 200) {
-      drawConfigScreen("Iesire fara salvare...");
+      drawConfigScreen("IESIRE FARA SALVARE");
       delay(300);
       ESP.restart();
     }
@@ -1141,7 +1101,7 @@ static bool elmFindEcu() {
     String r = elmSendCommand("0100", 15000);   // initializarea pe linia K poate dura ~10s
     if (r.indexOf("41 00") >= 0) {
       String dp = elmSendCommand("ATDPN", 2000);
-      lastEcuMsg = "ECU OK, protocol " + dp;
+      lastEcuMsg = "ECU OK PROT " + dp;
       // ATDPN: "6".."9" (sau "A6".."A9") = CAN; restul = linie K / J1850
       char pc = dp.length() ? dp[dp.length() - 1] : '0';
       isCanProtocol = (pc >= '6' && pc <= '9') || (pc >= 'A' && pc <= 'C');
@@ -1365,7 +1325,7 @@ void setup() {
 
   create_dashboard();
   create_error_screen();
-  set_status("Bluetooth: pornire...");
+  set_status("PORNIRE BT...");
   lv_timer_handler();   // forteaza afisarea statusului pe ecran inainte de pasii blocanti de mai jos
 
   // de acum, o apasare pe BOOT comuta intre date live si lista de erori
@@ -1420,12 +1380,12 @@ void loop() {
     elmEcuOk = false;
     if (millis() - lastReconnectAttempt > RECONNECT_INTERVAL_MS) {
       lastReconnectAttempt = millis();
-      set_status_short("Conectare la ELM327...");
+      set_status_short("CONECTARE ELM...");
       elmLinkUp = connectELM();
       if (!elmLinkUp) {
-        set_status_short("Nu gasesc ELM327 - reincerc...");
+        set_status_short("ELM327 NEGASIT");
       } else {
-        set_status_short("Conectat, caut ECU (poate dura 1 min)...");
+        set_status_short("CAUT ECU...");
         elmEcuOk = elmInit();
         set_status_short(lastEcuMsg);
         lastEcuRetry = millis();
@@ -1441,7 +1401,7 @@ void loop() {
     updateBattery();
     if (millis() - lastEcuRetry > ECU_RETRY_MS) {
       lastEcuRetry = millis();
-      set_status_short("Reincerc ECU... (contact pe ON?)");
+      set_status_short("REINCERC ECU...");
       elmEcuOk = elmFindEcu();
       ecuFailCycles = 0;
     }
@@ -1498,12 +1458,12 @@ void loop() {
     // 3 cicluri la rand fara niciun raspuns -> ECU pierdut (ex. contact OFF)
     if (++ecuFailCycles >= 3) {
       elmEcuOk = false;
-      lastEcuMsg = "ECU nu mai raspunde";
+      lastEcuMsg = "ECU NU RASPUNDE";
       lastEcuRetry = millis();
     }
   } else {
     ecuFailCycles = 0;
   }
-  set_status_short(elmEcuOk ? "OK - live (" + String(okCount) + "/" + String(total) + " PID)" : lastEcuMsg);
+  set_status_short(elmEcuOk ? "LIVE " + String(okCount) + "/" + String(total) : lastEcuMsg);
   delay(5);
 }
